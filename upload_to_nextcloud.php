@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-$nextcloudBaseUrl = 'http://192.168.0.106:8081';
-$nextcloudUser = 'admin';
-$nextcloudPassword = 'admin123456';
-$localFilePath = __DIR__ . '/Разработчик Bitrix Framework.pdf';
+$nextcloudBaseUrl = 'http://your-nextcloud:8080';
+$nextcloudUser = 'your-username';
+$nextcloudPassword = 'your-password';
+$localFilePath = __DIR__ . '/file.txt';
 $remoteDirectory = '/Bitrix24/uploads';
 $remoteFileName = null;
 $createShareLink = true;
