@@ -402,6 +402,101 @@ function createPublicShareLink(
     return $share;
 }
 
+function uploadMultipleFilesToNextcloud(
+    string $baseUrl,
+    string $user,
+    string $password,
+    array $fileValues,
+    string $remoteDir,
+    string $fileField,
+    int $itemId
+): void {
+    ensureRemoteDirectoryExists($baseUrl, $user, $password, $remoteDir);
+
+    foreach ($fileValues as $index => $fileValue) {
+        $tempFile    = null;
+        $downloadUrl = null;
+        $fileName    = null;
+
+        try {
+            if (is_array($fileValue)) {
+                $downloadUrl = $fileValue['urlMachine'] ?? $fileValue['url'] ?? null;
+                $fileName    = isset($fileValue['name']) && is_string($fileValue['name']) ? $fileValue['name'] : null;
+            } elseif (is_numeric($fileValue)) {
+                $diskResult = CRest::call('disk.file.get', ['id' => (int) $fileValue]);
+                if (empty($diskResult['error'])) {
+                    $downloadUrl = $diskResult['result']['DOWNLOAD_URL'] ?? null;
+                    $fileName    = $diskResult['result']['NAME'] ?? null;
+                }
+            }
+
+            if ($downloadUrl === null) {
+                throw new RuntimeException('Cannot resolve download URL: ' . json_encode($fileValue));
+            }
+
+            logMessage('[' . $fileField . '] Multi #' . $index . ' downloading from: ' . $downloadUrl);
+
+            // Stream download directly to temp file — no RAM buffering
+            $tempFile        = tempnam(sys_get_temp_dir(), 'b24_');
+            $fh              = fopen($tempFile, 'wb');
+            $capturedHeaders = '';
+            $ch              = curl_init($downloadUrl);
+            curl_setopt_array($ch, [
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_CONNECTTIMEOUT => 10,
+                CURLOPT_TIMEOUT        => 300,
+                CURLOPT_FILE           => $fh,
+                CURLOPT_HEADERFUNCTION => static function ($curl, string $header) use (&$capturedHeaders): int {
+                    $capturedHeaders .= $header;
+                    return strlen($header);
+                },
+            ]);
+            $ok        = curl_exec($ch);
+            $httpCode  = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+            $curlError = curl_error($ch);
+            curl_close($ch);
+            fclose($fh);
+
+            if ($ok === false || $httpCode !== 200) {
+                @unlink($tempFile);
+                $tempFile = null;
+                throw new RuntimeException('Download failed: HTTP=' . $httpCode . ' curl=' . $curlError);
+            }
+
+            if (preg_match('/filename\*\s*=\s*UTF-8\'\'([^\s;]+)/i', $capturedHeaders, $m)) {
+                $fileName = urldecode($m[1]);
+            } elseif (preg_match('/filename\s*=\s*"([^"]+)"/i', $capturedHeaders, $m)) {
+                $fileName = $m[1];
+            } elseif (preg_match('/filename\s*=\s*([^\s;]+)/i', $capturedHeaders, $m)) {
+                $fileName = trim($m[1]);
+            }
+
+            if ($fileName === null || $fileName === '') {
+                $fileName = $fileField . '_' . $itemId . '_' . $index . '.bin';
+            }
+
+            $safeFileName  = preg_replace('/[^\w.\-]/u', '_', $fileName);
+            $namedTempFile = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'b24_' . uniqid('', true) . '_' . $safeFileName;
+            rename($tempFile, $namedTempFile);
+            $tempFile = $namedTempFile;
+
+            logMessage('[' . $fileField . '] Multi #' . $index . ' downloaded: ' . $fileName . ' (' . filesize($tempFile) . ' bytes)');
+
+            uploadFileToNextcloud($baseUrl, $user, $password, $tempFile, $remoteDir, $fileName);
+
+            @unlink($tempFile);
+            $tempFile = null;
+
+        } catch (Throwable $e) {
+            logMessage('[' . $fileField . '] Multi #' . $index . ' ERROR: ' . $e->getMessage());
+            if ($tempFile !== null) {
+                @unlink($tempFile);
+            }
+        }
+    }
+}
+
 function uploadFileToNextcloud(
     string $baseUrl,
     string $user,
@@ -433,12 +528,6 @@ function uploadFileToNextcloud(
     $fileSize = filesize($localFilePath);
     logMessage('Local file is readable. Size: ' . ($fileSize === false ? 'unknown' : (string) $fileSize) . ' bytes');
 
-    $fileContents = file_get_contents($localFilePath);
-
-    if ($fileContents === false) {
-        throw new RuntimeException('Could not read local file: ' . $localFilePath);
-    }
-
     $remoteFileName = $remoteFileName ?? basename($localFilePath);
     $remoteFileName = trim($remoteFileName);
 
@@ -452,22 +541,49 @@ function uploadFileToNextcloud(
 
     $remotePath = '/' . trim($remoteDirectory, '/');
     $remotePath = rtrim($remotePath, '/') . '/' . $remoteFileName;
-    $webDavUrl = buildWebDavUrl($baseUrl, $user, $remotePath);
+    $webDavUrl  = buildWebDavUrl($baseUrl, $user, $remotePath);
 
     logMessage('Uploading file to remote path: ' . $remotePath);
     logMessage('Upload WebDAV URL: ' . $webDavUrl);
 
-    $response = requestWebDav(
-        'PUT',
-        $webDavUrl,
-        $user,
-        $password,
-        $fileContents,
-        ['Content-Type: application/octet-stream']
-    );
+    // Stream file directly from disk — no RAM buffering
+    $fileHandle = fopen($localFilePath, 'rb');
+    if ($fileHandle === false) {
+        throw new RuntimeException('Could not open local file for reading: ' . $localFilePath);
+    }
 
-    $statusCode = $response['statusCode'];
-    logMessage('PUT finished with HTTP status: ' . $statusCode);
+    $curl = curl_init($webDavUrl);
+    if ($curl === false) {
+        fclose($fileHandle);
+        throw new RuntimeException('Could not initialize curl.');
+    }
+
+    curl_setopt_array($curl, [
+        CURLOPT_PUT            => true,
+        CURLOPT_INFILE         => $fileHandle,
+        CURLOPT_INFILESIZE     => $fileSize !== false ? $fileSize : -1,
+        CURLOPT_USERPWD        => $user . ':' . $password,
+        CURLOPT_HTTPAUTH       => CURLAUTH_BASIC,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER         => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_TIMEOUT        => 300,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/octet-stream'],
+    ]);
+
+    $response   = curl_exec($curl);
+    $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+    $totalTime  = (float) curl_getinfo($curl, CURLINFO_TOTAL_TIME);
+    $curlError  = curl_error($curl);
+    curl_close($curl);
+    fclose($fileHandle);
+
+    logMessage('PUT finished with HTTP status: ' . $statusCode . ', time: ' . number_format($totalTime, 3) . 's');
+
+    if ($response === false) {
+        throw new RuntimeException('curl error while uploading: ' . $curlError);
+    }
 
     if (!in_array($statusCode, [200, 201, 204], true)) {
         if ($statusCode === 401 || $statusCode === 403) {
@@ -485,8 +601,9 @@ function uploadFileToNextcloud(
 
     return [
         'localFilePath' => $localFilePath,
-        'remotePath' => $remotePath,
-        'webDavUrl' => $webDavUrl,
-        'statusCode' => $statusCode,
+        'remotePath'    => $remotePath,
+        'webDavUrl'     => $webDavUrl,
+        'statusCode'    => $statusCode,
     ];
 }
+
