@@ -147,7 +147,7 @@ try {
                 logMessage("[$fileField] Folder share URL ($fileCount files): $shareUrl");
 
                 $fieldsToUpdate[$linkField]    = $shareUrl;
-                $fileFieldsToClear[$fileField] = [];
+                $fileFieldsToClear[$fileField] = '';
 
             } else {
                 // --- Single file: upload to element folder, share the file ---
@@ -229,7 +229,7 @@ try {
                 $tempFile = null;
 
                 $fieldsToUpdate[$linkField]    = $shareUrl;
-                $fileFieldsToClear[$fileField] = [];
+                $fileFieldsToClear[$fileField] = '';
             }
 
         } catch (Throwable $e) {
